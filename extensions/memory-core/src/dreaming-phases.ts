@@ -390,6 +390,7 @@ type DailyIngestionBatch = {
 type DailyIngestionFileState = {
   mtimeMs: number;
   size: number;
+  contentKind?: "durable";
 };
 
 type DailyIngestionState = {
@@ -424,6 +425,7 @@ function normalizeDailyIngestionState(raw: unknown): DailyIngestionState {
     files[key] = {
       mtimeMs: Math.floor(mtimeMs),
       size: Math.floor(size),
+      ...(file.contentKind === "durable" ? { contentKind: "durable" } : {}),
     };
   }
   return {
@@ -1068,7 +1070,30 @@ type DailyIngestionCandidate = {
   day: string;
   relativePath: string;
   raw: string;
+  fingerprint: DailyIngestionFileState;
+  previous?: DailyIngestionFileState;
 };
+
+function dailyIngestionFilesEqual(
+  left: Record<string, DailyIngestionFileState>,
+  right: Record<string, DailyIngestionFileState>,
+): boolean {
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) {
+    return false;
+  }
+  return leftKeys.every((key) => {
+    const leftEntry = left[key];
+    const rightEntry = right[key];
+    return (
+      rightEntry !== undefined &&
+      leftEntry?.mtimeMs === rightEntry.mtimeMs &&
+      leftEntry?.size === rightEntry.size &&
+      leftEntry?.contentKind === rightEntry.contentKind
+    );
+  });
+}
 
 async function collectDailyIngestionBatches(params: {
   workspaceDir: string;
@@ -1115,7 +1140,7 @@ async function collectDailyIngestionBatches(params: {
   const batches: DailyIngestionBatch[] = [];
   const nextFiles: Record<string, DailyIngestionFileState> = {};
   const changedCandidates: DailyIngestionCandidate[] = [];
-  let changed = false;
+  let trackedFileCount = 0;
   for (const file of files) {
     const relativePath = `memory/${file.fileName}`;
     const filePath = path.join(memoryDir, file.fileName);
@@ -1126,6 +1151,20 @@ async function collectDailyIngestionBatches(params: {
       throw err;
     });
     if (!stat) {
+      continue;
+    }
+    const fingerprint: DailyIngestionFileState = {
+      mtimeMs: Math.floor(Math.max(0, stat.mtimeMs)),
+      size: Math.floor(Math.max(0, stat.size)),
+    };
+    const previous = params.state.files[relativePath];
+    const unchanged =
+      previous !== undefined &&
+      previous.mtimeMs === fingerprint.mtimeMs &&
+      previous.size === fingerprint.size;
+    if (unchanged && previous?.contentKind === "durable") {
+      nextFiles[relativePath] = previous;
+      trackedFileCount += 1;
       continue;
     }
     const raw = await fs.readFile(filePath, "utf-8").catch((err: unknown) => {
@@ -1140,30 +1179,36 @@ async function collectDailyIngestionBatches(params: {
     if (isSessionSummaryDailyMemory(raw)) {
       continue;
     }
-    const fingerprint: DailyIngestionFileState = {
-      mtimeMs: Math.floor(Math.max(0, stat.mtimeMs)),
-      size: Math.floor(Math.max(0, stat.size)),
+    const durableFingerprint: DailyIngestionFileState = {
+      ...fingerprint,
+      contentKind: "durable",
     };
-    nextFiles[relativePath] = fingerprint;
-    const previous = params.state.files[relativePath];
-    const unchanged =
-      previous !== undefined &&
-      previous.mtimeMs === fingerprint.mtimeMs &&
-      previous.size === fingerprint.size;
-    if (!unchanged) {
-      changed = true;
-      changedCandidates.push({
-        day: file.day,
-        relativePath,
-        raw,
-      });
+    if (unchanged) {
+      nextFiles[relativePath] = durableFingerprint;
+      trackedFileCount += 1;
+      continue;
     }
+    trackedFileCount += 1;
+    changedCandidates.push({
+      day: file.day,
+      relativePath,
+      raw,
+      fingerprint: durableFingerprint,
+      previous,
+    });
   }
 
   const totalCap = Math.max(20, params.limit * 4);
-  const perFileCap = Math.max(6, Math.ceil(totalCap / Math.max(1, Object.keys(nextFiles).length)));
+  const perFileCap = Math.max(6, Math.ceil(totalCap / Math.max(1, trackedFileCount)));
   let total = 0;
+  let exhausted = false;
   for (const candidate of changedCandidates) {
+    if (exhausted) {
+      if (candidate.previous) {
+        nextFiles[candidate.relativePath] = candidate.previous;
+      }
+      continue;
+    }
     const lines = stripManagedDailyDreamingLines(candidate.raw.split(/\r?\n/));
     const chunks = buildDailySnippetChunks(lines, perFileCap);
     const results: MemorySearchResult[] = [];
@@ -1181,23 +1226,14 @@ async function collectDailyIngestionBatches(params: {
       }
     }
     if (results.length === 0) {
+      nextFiles[candidate.relativePath] = candidate.fingerprint;
       continue;
     }
     batches.push({ day: candidate.day, results });
+    nextFiles[candidate.relativePath] = candidate.fingerprint;
     total += results.length;
     if (total >= totalCap) {
-      break;
-    }
-  }
-
-  if (!changed) {
-    const previousKeys = Object.keys(params.state.files);
-    const nextKeys = Object.keys(nextFiles);
-    if (
-      previousKeys.length !== nextKeys.length ||
-      previousKeys.some((key) => !Object.hasOwn(nextFiles, key))
-    ) {
-      changed = true;
+      exhausted = true;
     }
   }
 
@@ -1207,7 +1243,7 @@ async function collectDailyIngestionBatches(params: {
       version: 1,
       files: nextFiles,
     },
-    changed,
+    changed: !dailyIngestionFilesEqual(params.state.files, nextFiles),
   };
 }
 
