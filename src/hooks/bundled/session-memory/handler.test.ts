@@ -266,7 +266,7 @@ describe("session-memory hook", () => {
         },
       });
 
-      expect(files).toEqual(["2025-12-31-2330.md"]);
+      expect(files).toEqual(["2025-12-31-233015-u043015.md"]);
       expect(memoryContent).toContain("# Session: 2025-12-31 23:30:15 America/New_York");
       expect(memoryContent).not.toContain("# Session: 2026-01-01 04:30:15 UTC");
     });
