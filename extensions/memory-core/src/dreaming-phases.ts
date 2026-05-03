@@ -10,7 +10,11 @@ import {
   parseUsageCountedSessionIdFromFileName,
   sessionPathForFile,
 } from "openclaw/plugin-sdk/memory-core-host-engine-qmd";
-import type { MemorySearchResult } from "openclaw/plugin-sdk/memory-core-host-runtime-files";
+import {
+  isSessionSummaryDailyMemory,
+  parseDailyMemoryFileName,
+  type MemorySearchResult,
+} from "openclaw/plugin-sdk/memory-core-host-runtime-files";
 import {
   formatMemoryDreamingDay,
   resolveMemoryDreamingWorkspaces,
@@ -72,7 +76,7 @@ type RunPhaseIfTriggeredParams = {
 );
 const LIGHT_SLEEP_EVENT_TEXT = "__openclaw_memory_core_light_sleep__";
 const REM_SLEEP_EVENT_TEXT = "__openclaw_memory_core_rem_sleep__";
-const DAILY_MEMORY_FILENAME_RE = /^(\d{4}-\d{2}-\d{2})\.md$/;
+const ISO_DAY_HEADING_RE = /^\d{4}-\d{2}-\d{2}$/;
 const DAILY_INGESTION_STATE_RELATIVE_PATH = path.join("memory", ".dreams", "daily-ingestion.json");
 const DAILY_INGESTION_SCORE = 0.62;
 const DAILY_INGESTION_MAX_SNIPPET_CHARS = 280;
@@ -159,7 +163,7 @@ function normalizeDailyHeading(line: string): string | null {
     return null;
   }
   const heading = match[1] ? normalizeDailyListMarker(match[1]) : "";
-  if (!heading || DAILY_MEMORY_FILENAME_RE.test(heading) || isGenericDailyHeading(heading)) {
+  if (!heading || ISO_DAY_HEADING_RE.test(heading) || isGenericDailyHeading(heading)) {
     return null;
   }
   return heading.slice(0, DAILY_INGESTION_MAX_SNIPPET_CHARS).replace(/\s+/g, " ");
@@ -386,24 +390,78 @@ type DailyIngestionBatch = {
 type DailyIngestionFileState = {
   mtimeMs: number;
   size: number;
+  contentKind?: "durable";
+};
+
+type DailyIngestionPendingFileState = DailyIngestionFileState & {
+  chunkOffset: number;
 };
 
 type DailyIngestionState = {
   version: 1;
   files: Record<string, DailyIngestionFileState>;
+  pendingPaths?: string[];
+  pendingFiles?: Record<string, DailyIngestionPendingFileState>;
 };
 
 function resolveDailyIngestionStatePath(workspaceDir: string): string {
   return path.join(workspaceDir, DAILY_INGESTION_STATE_RELATIVE_PATH);
 }
 
+function normalizeDailyPendingPaths(raw: unknown): string[] {
+  return [...new Set((Array.isArray(raw) ? raw : []).filter((value) => typeof value === "string"))]
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .toSorted();
+}
+
+function normalizeDailyPendingFiles(raw: unknown): Record<string, DailyIngestionPendingFileState> {
+  const record = asRecord(raw);
+  if (!record) {
+    return {};
+  }
+  const pendingFiles: Record<string, DailyIngestionPendingFileState> = {};
+  for (const [key, value] of Object.entries(record)) {
+    const file = asRecord(value);
+    if (!file || typeof key !== "string" || key.trim().length === 0) {
+      continue;
+    }
+    const mtimeMs = Number(file.mtimeMs);
+    const size = Number(file.size);
+    const chunkOffset = Number(file.chunkOffset);
+    if (
+      !Number.isFinite(mtimeMs) ||
+      mtimeMs < 0 ||
+      !Number.isFinite(size) ||
+      size < 0 ||
+      !Number.isFinite(chunkOffset) ||
+      chunkOffset <= 0
+    ) {
+      continue;
+    }
+    pendingFiles[key] = {
+      mtimeMs: Math.floor(mtimeMs),
+      size: Math.floor(size),
+      chunkOffset: Math.floor(chunkOffset),
+      ...(file.contentKind === "durable" ? { contentKind: "durable" } : {}),
+    };
+  }
+  return pendingFiles;
+}
+
 function normalizeDailyIngestionState(raw: unknown): DailyIngestionState {
   const record = asRecord(raw);
   const filesRaw = asRecord(record?.files);
+  const pendingFiles = normalizeDailyPendingFiles(record?.pendingFiles);
+  const pendingPaths = [
+    ...new Set([...normalizeDailyPendingPaths(record?.pendingPaths), ...Object.keys(pendingFiles)]),
+  ].toSorted();
   if (!filesRaw) {
     return {
       version: 1,
       files: {},
+      ...(pendingPaths.length > 0 ? { pendingPaths } : {}),
+      ...(Object.keys(pendingFiles).length > 0 ? { pendingFiles } : {}),
     };
   }
   const files: Record<string, DailyIngestionFileState> = {};
@@ -420,11 +478,14 @@ function normalizeDailyIngestionState(raw: unknown): DailyIngestionState {
     files[key] = {
       mtimeMs: Math.floor(mtimeMs),
       size: Math.floor(size),
+      ...(file.contentKind === "durable" ? { contentKind: "durable" } : {}),
     };
   }
   return {
     version: 1,
     files,
+    ...(pendingPaths.length > 0 ? { pendingPaths } : {}),
+    ...(Object.keys(pendingFiles).length > 0 ? { pendingFiles } : {}),
   };
 }
 
@@ -1060,6 +1121,69 @@ type DailyIngestionCollectionResult = {
   changed: boolean;
 };
 
+type DailyIngestionCandidate = {
+  day: string;
+  relativePath: string;
+  raw: string;
+  fingerprint: DailyIngestionFileState;
+  pendingChunkOffset: number;
+  previous?: DailyIngestionFileState;
+};
+
+function dailyIngestionFilesEqual(
+  left: Record<string, DailyIngestionFileState>,
+  right: Record<string, DailyIngestionFileState>,
+): boolean {
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) {
+    return false;
+  }
+  return leftKeys.every((key) => {
+    const leftEntry = left[key];
+    const rightEntry = right[key];
+    return (
+      rightEntry !== undefined &&
+      leftEntry?.mtimeMs === rightEntry.mtimeMs &&
+      leftEntry?.size === rightEntry.size &&
+      leftEntry?.contentKind === rightEntry.contentKind
+    );
+  });
+}
+
+function dailyIngestionPendingPathsEqual(
+  left: string[] | undefined,
+  right: string[] | undefined,
+): boolean {
+  const leftValues = left ?? [];
+  const rightValues = right ?? [];
+  if (leftValues.length !== rightValues.length) {
+    return false;
+  }
+  return leftValues.every((value, index) => value === rightValues[index]);
+}
+
+function dailyIngestionPendingFilesEqual(
+  left: Record<string, DailyIngestionPendingFileState> | undefined,
+  right: Record<string, DailyIngestionPendingFileState> | undefined,
+): boolean {
+  const leftEntries = Object.entries(left ?? {});
+  const rightEntries = Object.entries(right ?? {});
+  if (leftEntries.length !== rightEntries.length) {
+    return false;
+  }
+  return leftEntries.every(([key, leftEntry]) => {
+    const rightEntry = right?.[key];
+    return (
+      rightEntry !== undefined &&
+      leftEntry.mtimeMs === rightEntry.mtimeMs &&
+      leftEntry.size === rightEntry.size &&
+      leftEntry.contentKind === rightEntry.contentKind &&
+      leftEntry.chunkOffset === rightEntry.chunkOffset
+    );
+  });
+}
+
 async function collectDailyIngestionBatches(params: {
   workspaceDir: string;
   lookbackDays: number;
@@ -1067,38 +1191,77 @@ async function collectDailyIngestionBatches(params: {
   nowMs: number;
   state: DailyIngestionState;
 }): Promise<DailyIngestionCollectionResult> {
+  type ListedDailyIngestionFile = {
+    fileName: string;
+    day: string;
+    canonical: boolean;
+    relativePath: string;
+    pendingIndex: number | undefined;
+    pendingFile: DailyIngestionPendingFileState | undefined;
+  };
+
   const memoryDir = path.join(params.workspaceDir, "memory");
   const cutoffMs = calculateLookbackCutoffMs(params.nowMs, params.lookbackDays);
+  const pendingPathOrder = new Map(
+    (params.state.pendingPaths ?? []).map((relativePath, index) => [relativePath, index] as const),
+  );
   const entries = await fs.readdir(memoryDir, { withFileTypes: true }).catch((err: unknown) => {
     if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
       return [] as Dirent[];
     }
     throw err;
   });
-  const files = entries
+  const files: ListedDailyIngestionFile[] = entries
     .filter((entry) => entry.isFile())
     .map((entry) => {
-      const match = entry.name.match(DAILY_MEMORY_FILENAME_RE);
-      if (!match) {
+      const parsed = parseDailyMemoryFileName(entry.name);
+      if (!parsed) {
         return null;
       }
-      const day = match[1];
-      if (!isDayWithinLookback(day, cutoffMs)) {
+      const relativePath = `memory/${parsed.fileName}`;
+      const pendingIndex = pendingPathOrder.get(relativePath);
+      const pendingFile = params.state.pendingFiles?.[relativePath];
+      const day = parsed.day;
+      if (pendingIndex === undefined && !isDayWithinLookback(day, cutoffMs)) {
         return null;
       }
-      return { fileName: entry.name, day };
+      return {
+        fileName: parsed.fileName,
+        day,
+        canonical: parsed.canonical,
+        relativePath,
+        pendingIndex,
+        pendingFile,
+      };
     })
-    .filter((entry): entry is { fileName: string; day: string } => entry !== null)
-    .toSorted((a, b) => b.day.localeCompare(a.day));
+    .filter((entry): entry is ListedDailyIngestionFile => entry !== null)
+    .toSorted((a, b) => {
+      const leftPending = a.pendingIndex !== undefined;
+      const rightPending = b.pendingIndex !== undefined;
+      if (leftPending !== rightPending) {
+        return leftPending ? -1 : 1;
+      }
+      if (leftPending && rightPending && a.pendingIndex !== b.pendingIndex) {
+        return (a.pendingIndex ?? 0) - (b.pendingIndex ?? 0);
+      }
+      const dayCmp = b.day.localeCompare(a.day);
+      if (dayCmp !== 0) {
+        return dayCmp;
+      }
+      if (a.canonical !== b.canonical) {
+        return a.canonical ? -1 : 1;
+      }
+      return a.fileName.localeCompare(b.fileName);
+    });
 
   const batches: DailyIngestionBatch[] = [];
   const nextFiles: Record<string, DailyIngestionFileState> = {};
-  let changed = false;
-  const totalCap = Math.max(20, params.limit * 4);
-  const perFileCap = Math.max(6, Math.ceil(totalCap / Math.max(1, Math.max(files.length, 1))));
-  let total = 0;
+  const pendingPaths = new Set<string>();
+  const pendingFiles: Record<string, DailyIngestionPendingFileState> = {};
+  const changedCandidates: DailyIngestionCandidate[] = [];
+  let trackedFileCount = 0;
   for (const file of files) {
-    const relativePath = `memory/${file.fileName}`;
+    const relativePath = file.relativePath;
     const filePath = path.join(memoryDir, file.fileName);
     const stat = await fs.stat(filePath).catch((err: unknown) => {
       if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
@@ -1113,18 +1276,22 @@ async function collectDailyIngestionBatches(params: {
       mtimeMs: Math.floor(Math.max(0, stat.mtimeMs)),
       size: Math.floor(Math.max(0, stat.size)),
     };
-    nextFiles[relativePath] = fingerprint;
     const previous = params.state.files[relativePath];
     const unchanged =
       previous !== undefined &&
       previous.mtimeMs === fingerprint.mtimeMs &&
       previous.size === fingerprint.size;
-    if (!unchanged) {
-      changed = true;
-    } else {
+    const pendingChunkOffset =
+      file.pendingFile &&
+      file.pendingFile.mtimeMs === fingerprint.mtimeMs &&
+      file.pendingFile.size === fingerprint.size
+        ? Math.max(0, Math.floor(file.pendingFile.chunkOffset))
+        : 0;
+    if (unchanged && previous?.contentKind === "durable") {
+      nextFiles[relativePath] = previous;
+      trackedFileCount += 1;
       continue;
     }
-
     const raw = await fs.readFile(filePath, "utf-8").catch((err: unknown) => {
       if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
         return "";
@@ -1134,12 +1301,52 @@ async function collectDailyIngestionBatches(params: {
     if (!raw) {
       continue;
     }
-    const lines = stripManagedDailyDreamingLines(raw.split(/\r?\n/));
+    if (isSessionSummaryDailyMemory(raw)) {
+      continue;
+    }
+    const durableFingerprint: DailyIngestionFileState = {
+      ...fingerprint,
+      contentKind: "durable",
+    };
+    if (unchanged) {
+      nextFiles[relativePath] = durableFingerprint;
+      trackedFileCount += 1;
+      continue;
+    }
+    trackedFileCount += 1;
+    changedCandidates.push({
+      day: file.day,
+      relativePath,
+      raw,
+      fingerprint: durableFingerprint,
+      pendingChunkOffset,
+      previous,
+    });
+  }
+
+  const totalCap = Math.max(20, params.limit * 4);
+  const perFileCap = Math.max(6, Math.ceil(totalCap / Math.max(1, trackedFileCount)));
+  let total = 0;
+  let exhausted = false;
+  for (const candidate of changedCandidates) {
+    if (exhausted) {
+      if (candidate.previous) {
+        nextFiles[candidate.relativePath] = candidate.previous;
+      }
+      pendingPaths.add(candidate.relativePath);
+      pendingFiles[candidate.relativePath] = {
+        ...candidate.fingerprint,
+        chunkOffset: candidate.pendingChunkOffset,
+      };
+      continue;
+    }
+    const lines = stripManagedDailyDreamingLines(candidate.raw.split(/\r?\n/));
     const chunks = buildDailySnippetChunks(lines, perFileCap);
+    const chunkOffset = Math.min(candidate.pendingChunkOffset, chunks.length);
     const results: MemorySearchResult[] = [];
-    for (const chunk of chunks) {
+    for (const chunk of chunks.slice(chunkOffset)) {
       results.push({
-        path: relativePath,
+        path: candidate.relativePath,
         startLine: chunk.startLine,
         endLine: chunk.endLine,
         score: DAILY_INGESTION_SCORE,
@@ -1151,33 +1358,45 @@ async function collectDailyIngestionBatches(params: {
       }
     }
     if (results.length === 0) {
+      nextFiles[candidate.relativePath] = candidate.fingerprint;
       continue;
     }
-    batches.push({ day: file.day, results });
+    const nextChunkOffset = chunkOffset + results.length;
+    const fullyIngested = nextChunkOffset >= chunks.length;
+    batches.push({ day: candidate.day, results });
     total += results.length;
+    if (!fullyIngested) {
+      if (candidate.previous) {
+        nextFiles[candidate.relativePath] = candidate.previous;
+      }
+      pendingPaths.add(candidate.relativePath);
+      pendingFiles[candidate.relativePath] = {
+        ...candidate.fingerprint,
+        chunkOffset: nextChunkOffset,
+      };
+      exhausted = true;
+      continue;
+    }
+    nextFiles[candidate.relativePath] = candidate.fingerprint;
     if (total >= totalCap) {
-      break;
+      exhausted = true;
     }
   }
 
-  if (!changed) {
-    const previousKeys = Object.keys(params.state.files);
-    const nextKeys = Object.keys(nextFiles);
-    if (
-      previousKeys.length !== nextKeys.length ||
-      previousKeys.some((key) => !Object.hasOwn(nextFiles, key))
-    ) {
-      changed = true;
-    }
-  }
-
+  const nextPendingPaths = [...pendingPaths].toSorted();
+  const nextPendingFiles = Object.keys(pendingFiles).length > 0 ? pendingFiles : undefined;
   return {
     batches,
     nextState: {
       version: 1,
       files: nextFiles,
+      ...(nextPendingPaths.length > 0 ? { pendingPaths: nextPendingPaths } : {}),
+      ...(nextPendingFiles ? { pendingFiles: nextPendingFiles } : {}),
     },
-    changed,
+    changed:
+      !dailyIngestionFilesEqual(params.state.files, nextFiles) ||
+      !dailyIngestionPendingPathsEqual(params.state.pendingPaths, nextPendingPaths) ||
+      !dailyIngestionPendingFilesEqual(params.state.pendingFiles, nextPendingFiles),
   };
 }
 
@@ -1239,15 +1458,27 @@ export async function seedHistoricalDailyMemorySignals(params: {
   const resolved = normalizedPaths
     .map((filePath) => {
       const fileName = path.basename(filePath);
-      const match = fileName.match(DAILY_MEMORY_FILENAME_RE);
-      if (!match) {
-        return { filePath, day: null as string | null };
+      const parsed = parseDailyMemoryFileName(fileName);
+      if (!parsed) {
+        return { filePath, fileName, day: null as string | null, canonical: false };
       }
-      return { filePath, day: match[1] ?? null };
+      return {
+        filePath,
+        fileName: parsed.fileName,
+        day: parsed.day,
+        canonical: parsed.canonical,
+      };
     })
     .toSorted((a, b) => {
       if (a.day && b.day) {
-        return b.day.localeCompare(a.day);
+        const dayCmp = b.day.localeCompare(a.day);
+        if (dayCmp !== 0) {
+          return dayCmp;
+        }
+        if (a.canonical !== b.canonical) {
+          return a.canonical ? -1 : 1;
+        }
+        return a.fileName.localeCompare(b.fileName);
       }
       if (a.day) {
         return -1;
@@ -1258,19 +1489,14 @@ export async function seedHistoricalDailyMemorySignals(params: {
       return a.filePath.localeCompare(b.filePath);
     });
 
-  const valid = resolved.filter((entry): entry is { filePath: string; day: string } =>
-    Boolean(entry.day),
+  const valid = resolved.filter(
+    (entry): entry is { filePath: string; fileName: string; day: string; canonical: boolean } =>
+      Boolean(entry.day),
   );
   const skippedPaths = resolved.filter((entry) => !entry.day).map((entry) => entry.filePath);
   const totalCap = Math.max(20, params.limit * 4);
-  const perFileCap = Math.max(6, Math.ceil(totalCap / Math.max(1, valid.length)));
-  let importedSignalCount = 0;
-  let importedFileCount = 0;
-
+  const ingestible: Array<{ filePath: string; fileName: string; day: string; raw: string }> = [];
   for (const entry of valid) {
-    if (importedSignalCount >= totalCap) {
-      break;
-    }
     const raw = await fs.readFile(entry.filePath, "utf-8").catch((err: unknown) => {
       if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
         skippedPaths.push(entry.filePath);
@@ -1278,15 +1504,30 @@ export async function seedHistoricalDailyMemorySignals(params: {
       }
       throw err;
     });
-    if (!raw) {
+    if (!raw || isSessionSummaryDailyMemory(raw)) {
       continue;
     }
-    const lines = stripManagedDailyDreamingLines(raw.split(/\r?\n/));
+    ingestible.push({
+      filePath: entry.filePath,
+      fileName: entry.fileName,
+      day: entry.day,
+      raw,
+    });
+  }
+  const perFileCap = Math.max(6, Math.ceil(totalCap / Math.max(1, ingestible.length)));
+  let importedSignalCount = 0;
+  let importedFileCount = 0;
+
+  for (const entry of ingestible) {
+    if (importedSignalCount >= totalCap) {
+      break;
+    }
+    const lines = stripManagedDailyDreamingLines(entry.raw.split(/\r?\n/));
     const chunks = buildDailySnippetChunks(lines, perFileCap);
     const results: MemorySearchResult[] = [];
     for (const chunk of chunks) {
       results.push({
-        path: `memory/${entry.day}.md`,
+        path: `memory/${entry.fileName}`,
         startLine: chunk.startLine,
         endLine: chunk.endLine,
         score: DAILY_INGESTION_SCORE,
@@ -1838,6 +2079,7 @@ async function runPhaseIfTriggered(
 export const __testing = {
   runPhaseIfTriggered,
   previewRemDreaming,
+  collectDailyIngestionBatches,
   constants: {
     LIGHT_SLEEP_EVENT_TEXT,
     REM_SLEEP_EVENT_TEXT,
