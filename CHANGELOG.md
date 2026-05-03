@@ -484,6 +484,10 @@ Docs: https://docs.openclaw.ai
 - Heartbeats/agents: add a structured `heartbeat_respond` tool for tool-capable heartbeat runs so agents can record quiet outcomes or explicit notification text without relying only on `HEARTBEAT_OK` parsing. (#75765) Thanks @pashpashpash.
 - Gateway/config: allow `$include` directives to read files from operator-approved `OPENCLAW_INCLUDE_ROOTS` directories while preserving default config-directory confinement. Thanks @ificator.
 
+### Changes
+
+- Memory/sessions: index growing session transcripts incrementally by reusing unchanged chunk embeddings and only embedding new content, reducing O(n) full reindex overhead for long-running conversations. (#75179) Thanks @wr-web.
+
 ### Fixes
 
 - Agents/tools: skip unavailable media generation and PDF tool factories from the live reply path when Gateway metadata and the active auth store prove no configured provider can back them, while keeping explicit config and auth-backed providers on the normal factory path. Thanks @shakkernerd.
